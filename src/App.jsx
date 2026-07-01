@@ -141,25 +141,6 @@ export default function App() {
   };
 
   useEffect(() => {
-    const handleBiometricLogin = async (e) => {
-      try {
-        const { user_id, email } = e.detail;
-        setSession({ user: { id: user_id, email } });
-        await fetchProfile(user_id);
-        await handleClockIn(user_id);
-        localStorage.removeItem('biometric_auth');
-        toast.success('Login Biometrik Sukses, Wir! 🦅');
-      } catch (err) {
-        console.error('Gagal eksekusi auth biometrik:', err);
-        toast.error('Gagal sinkronisasi sesi wajah.');
-      }
-    };
-
-    window.addEventListener('biometric_login_success', handleBiometricLogin);
-    return () => window.removeEventListener('biometric_login_success', handleBiometricLogin);
-  }, []);
-
-  useEffect(() => {
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
       setSession(session);
       if (session?.user) {

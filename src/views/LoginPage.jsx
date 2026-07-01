@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import * as faceapi from 'face-api.js';
 import { supabase } from '../supabaseClient';
+import { invokeBiometricVerification } from '../utils/biometricVerification';
 import LoginLogo from '../assets/customs-logo.jpg';
 
 function calculateEAR(eyeLandmarks) {
@@ -49,35 +50,7 @@ export default function LoginPage() {
   const isRedirectingRef = useRef(false); // 🔥 Kill switch: stop detection loop after redirect
   const rafIdRef = useRef(null);
 
-  const [allProfiles, setAllProfiles] = useState([]);
-  const profilesRef = useRef([]);
   const [blinkCount, setBlinkCount] = useState(0);
-
-  useEffect(() => {
-async function fetchProfiles() {
-        // 🎯 FIX: Buang 'email' karena tidak ada di tabel profiles, pastikan kolom yang lain namanya pas!
-        const { data, error } = await supabase
-          .from('profiles')
-          .select('id, name, role, initials, face_descriptor')
-          .not('face_descriptor', 'is', null);
-
-      if (error) {
-        console.error('Error fetching profiles:', error);
-        return;
-      }
-
-      const formatted = data.map(p => ({
-        ...p,
-        descriptor: new Float32Array(p.face_descriptor)
-      }));
-
-      setAllProfiles(formatted);
-      profilesRef.current = formatted;
-      console.log(`🤖 Database profiles termuat sempurna di memori inti: ${formatted.length} data.`);
-    }
-
-    fetchProfiles();
-  }, []);
 
   useEffect(() => {
     let stream = null;
@@ -183,75 +156,44 @@ async function fetchProfiles() {
       rafId = requestAnimationFrame(detectLoop);
     };
 
-    if (allProfiles.length > 0) {
-      console.log('🚀 Memicu paksa mesin deteksi wajah C-SPACE...');
-      rafId = requestAnimationFrame(detectLoop);
-    }
+    rafId = requestAnimationFrame(detectLoop);
 
     return () => {
       if (rafId) cancelAnimationFrame(rafId);
     };
-  }, [allProfiles]);
+  }, []);
 
   const executeBiometricLogin = async (liveDescriptor) => {
-    let bestMatch = null;
-    let lowestDistance = 0.55; // Threshold andalan lu
+    try {
+      const verdict = await invokeBiometricVerification({
+        action: 'verify',
+        email,
+        descriptor: liveDescriptor,
+      });
 
-    if (profilesRef.current.length === 0) {
-      console.log('❌ Loop ditolak: Memori inti profiles masih kosong!');
-      return;
-    }
-
-    for (const profile of profilesRef.current) {
-      const dist = faceapi.euclideanDistance(liveDescriptor, profile.descriptor);
-      if (dist < lowestDistance) {
-        lowestDistance = dist;
-        bestMatch = profile;
-      }
-    }
-
-    if (bestMatch) {
-      console.log(`🎯 MUKA COCOK: ${bestMatch.name}`);
-      
-      try {
-        // 1. KUNCI LUAR: Simpan ID user ke localStorage dulu biar session-nya kebaca
-        localStorage.setItem('c_space_user_id', bestMatch.id);
-        
-        // 2. PROSES ABSENSI: Kita bungkus pakai try-catch terpisah biar kalaupun Supabase 401, login lu TETEP TEMBUS!
-        const hariIni = new Date().toISOString().split('T')[0];
-        const jamIni = new Date().toLocaleTimeString('en-US', { hour12: false });
-
-        const { error: attError } = await supabase
-          .from('attendance')
-          .insert([{ 
-            employee_id: bestMatch.id, 
-            date: hariIni, 
-            status: 'Present', 
-            clock_in: jamIni 
-          }]);
-
-        if (attError) {
-          console.warn("⚠️ Gagal mencatat absensi otomatis (RLS Block), tapi login diteruskan:", attError.message);
-        } else {
-          console.log("✅ Auto Clock-In Berhasil Dicatat!");
-        }
-
-      } catch (e) {
-        console.error("Gagal interaksi database:", e);
+      if (!verdict.allowed) {
+        setBiometricStatus('Unknown face');
+        setError('Wajah tidak dikenali. Gunakan email/password.');
+        return;
       }
 
-      // 3. LEMPAR LANGSUNG KE DASHBOARD! Jangan biarkan eror Supabase menahan lu!
-      console.log('🚀 Pengalihan paksa ke Dashboard...');
-      // Dispatch event for global auth sync
-      window.dispatchEvent(new CustomEvent('biometric_login_success', { detail: { user_id: bestMatch.id } }));
+      setBiometricStatus(`Face verified (${verdict.confidence}). Signing in...`);
+      const { error: loginError } = await supabase.auth.signInWithPassword({ email, password });
+      if (loginError) throw loginError;
+
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+      }
+      if (rafIdRef.current) {
+        cancelAnimationFrame(rafIdRef.current);
+      }
+
       setTimeout(() => {
         navigate('/dashboard');
       }, 300);
-
-
-    } else {
-      setBiometricStatus('Unknown face');
-      setError('Wajah tidak dikenali.');
+    } catch (err) {
+      console.error('Biometric auth error:', err);
+      setError(`Gagal login: ${err.message}`);
     }
   };
 
@@ -292,11 +234,20 @@ async function fetchProfiles() {
                     name,
                     role: 'employee',
                     initials: initials.toUpperCase(),
-                    face_descriptor: descriptorArray
                   })
                   .eq('id', newUser.id);
 
-                setBiometricStatus('Registrasi berhasil! Silakan berkedip untuk verifikasi.');
+                const enrollVerdict = await invokeBiometricVerification({
+                  action: 'enroll',
+                  descriptor: descriptorArray,
+                  metadata: { source: 'login-page-register' },
+                });
+
+                if (!enrollVerdict.allowed) {
+                  throw new Error(`Enrollment rejected: ${enrollVerdict.reason || 'UNKNOWN'}`);
+                }
+
+                setBiometricStatus(`Registrasi berhasil (${enrollVerdict.confidence}). Silakan login.`);
               }
             }
           }, 500);
@@ -309,6 +260,7 @@ async function fetchProfiles() {
       setError(err.message);
     } finally {
       setLoading(false);
+    }
     }
   };
 

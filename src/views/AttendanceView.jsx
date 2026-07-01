@@ -3,6 +3,7 @@ import { supabase } from '../supabaseClient';
 import ExportButton from '../components/ExportButton';
 import * as faceapi from 'face-api.js';
 import { pipeline } from '@huggingface/transformers';
+import { invokeBiometricVerification } from '../utils/biometricVerification';
 
 /**
  * COMPONENT: AttendanceView
@@ -96,38 +97,6 @@ const AttendanceView = ({ userProfile, attendance = [], allUsers = [], fetchAtte
     const autoClockInGuardRef = useRef(false);
     const autoClockOutGuardRef = useRef(false);
     const webcamStreamRef = useRef(null);
-
-    const parseStoredDescriptor = (value) => {
-        if (!value) return null;
-
-        let parsed = value;
-        if (typeof value === 'string') {
-            try {
-                parsed = JSON.parse(value);
-            } catch {
-                return null;
-            }
-        }
-
-        if (Array.isArray(parsed)) return new Float32Array(parsed);
-        if (parsed && Array.isArray(parsed.data)) return new Float32Array(parsed.data);
-        return null;
-    };
-
-    const normalizeDescriptorArray = (descriptor) => {
-        const values = Array.from(descriptor || [])
-            .map((value) => Number(value))
-            .filter((value) => Number.isFinite(value));
-
-        if (values.length !== 128) return null;
-        return values;
-    };
-
-    const descriptorToVectorLiteral = (descriptor) => {
-        const values = normalizeDescriptorArray(descriptor);
-        if (!values) return null;
-        return `[${values.join(',')}]`;
-    };
 
     const getRecordClockInTime = (record) => record?.clock_in || record?.created_at || '';
 
@@ -499,50 +468,11 @@ const AttendanceView = ({ userProfile, attendance = [], allUsers = [], fetchAtte
 
                 if (cancelled) return;
 
-                // Use the already-loaded profile object only. Avoid extra Supabase round-trips that can fail with 400.
-                const savedDescriptor = parseStoredDescriptor(userProfile.face_descriptor);
-                if (savedDescriptor) {
-                    setHasStoredFace(true);
-                    referenceDescriptorRef.current = savedDescriptor;
-                    setRegisteredFaceSource('supabase');
-                    setFaceStatus('scanning');
-                    setFaceScannerMessage('Registered face loaded from Supabase profile. Scanning live stream...');
-                    return;
-                }
-
-                if (!userProfile.avatar_url) {
-                    setHasStoredFace(false);
-                    referenceDescriptorRef.current = null;
-                    setRegisteredFaceSource('none');
-                    setFaceStatus('error');
-                    setFaceScannerMessage('No registered face yet. Enroll from live Laptop Webcam frame or add a profile photo first.');
-                    return;
-                }
-
-                setFaceStatus('loading-reference');
-                setFaceScannerMessage('Reading your registered profile face...');
-
-                const referenceImage = await faceapi.fetchImage(userProfile.avatar_url);
-                const referenceDetection = await faceapi
-                    .detectSingleFace(referenceImage, new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.5 }))
-                    .withFaceLandmarks()
-                    .withFaceDescriptor();
-
-                if (cancelled) return;
-
-                if (!referenceDetection) {
-                    referenceDescriptorRef.current = null;
-                    setRegisteredFaceSource('none');
-                    setFaceStatus('error');
-                    setFaceScannerMessage('No face detected in your profile photo. Use a clearer frontal face image or enroll from live stream.');
-                    return;
-                }
-
-                referenceDescriptorRef.current = referenceDetection.descriptor;
-                setHasStoredFace(false);
-                setRegisteredFaceSource('profile-photo');
+                setHasStoredFace(true);
+                referenceDescriptorRef.current = null;
+                setRegisteredFaceSource('server-verification');
                 setFaceStatus('scanning');
-                setFaceScannerMessage('Profile face loaded. You can also enroll from live Laptop Webcam frame for better accuracy.');
+                setFaceScannerMessage('Server-side face verification is ready. Scanning live stream...');
             } catch (error) {
                 console.error('Face model loading error:', error);
                 if (cancelled) return;
@@ -599,17 +529,22 @@ const AttendanceView = ({ userProfile, attendance = [], allUsers = [], fetchAtte
                     });
                 }
 
-                const distance = faceapi.euclideanDistance(liveDetection.descriptor, referenceDescriptorRef.current);
-                const matched = distance <= FACE_MATCH_THRESHOLD;
+                const verdict = await invokeBiometricVerification({
+                    action: 'verify',
+                    email: userProfile.email,
+                    descriptor: Array.from(liveDetection.descriptor),
+                });
 
-                setFaceMatchDistance(distance);
+                const matched = Boolean(verdict.allowed);
+
+                setFaceMatchDistance(1 - (verdict.confidence ?? 0));
                 setIsFaceVerified(matched);
                 setFaceStatus(matched ? 'matched' : 'mismatch');
                 setFaceDetectionMode(liveDetection.source || 'faceapi');
                 setFaceScannerMessage(
                     matched
-                        ? 'Registered face matched. Attendance will be clocked in automatically.'
-                        : 'Face does not match the registered profile.'
+                        ? `Server matched face with confidence ${(verdict.confidence ?? 0).toFixed(3)}. Attendance will be clocked in automatically.`
+                        : `Server rejected face verification (${verdict.reason || 'FACE_MISMATCH'}).`
                 );
             } catch (error) {
                 console.info('Live face scan error:', error);
@@ -833,46 +768,24 @@ const AttendanceView = ({ userProfile, attendance = [], allUsers = [], fetchAtte
             referenceDescriptorRef.current = detection.descriptor;
 
             try {
-                const descriptorArray = normalizeDescriptorArray(detection.descriptor);
-                const embedding = descriptorToVectorLiteral(detection.descriptor);
+                const verdict = await invokeBiometricVerification({
+                    action: 'enroll',
+                    descriptor: Array.from(detection.descriptor),
+                    metadata: {
+                        source: 'esp32-cam-stream',
+                        model: 'face-api.js',
+                    },
+                });
 
-                if (!descriptorArray || !embedding) {
-                    throw new Error('Face descriptor must contain 128 numeric values.');
-                }
-
-                await supabase.from('faces').delete().eq('profile_id', userProfile.id);
-
-                const { error: insertErr } = await supabase
-                    .from('faces')
-                    .insert([{ 
-                        profile_id: userProfile.id,
-                        descriptor: descriptorArray,
-                        embedding,
-                        thumbnail_url: userProfile.avatar_url || null,
-                        is_primary: true,
-                        metadata: {
-                            source: 'esp32-cam-stream',
-                            model: 'face-api.js',
-                        },
-                    }]);
-
-                if (insertErr) {
-                    throw insertErr;
+                if (!verdict.allowed) {
+                    throw new Error(verdict.reason || 'Enroll rejected');
                 }
 
                 setHasStoredFace(true);
             } catch (err) {
-                console.warn('faces insert exception:', err);
-            }
-
-            const { error } = await supabase
-                .from('profiles')
-                .update({ face_descriptor: Array.from(detection.descriptor) })
-                .eq('id', userProfile.id);
-
-            if (error) {
+                console.warn('faces enroll exception:', err);
                 setFaceStatus('error');
-                setFaceScannerMessage(`Save enrolled face failed: ${error.message}`);
+                setFaceScannerMessage(`Save enrolled face failed: ${err.message}`);
                 return;
             }
 
@@ -893,22 +806,12 @@ const AttendanceView = ({ userProfile, attendance = [], allUsers = [], fetchAtte
         if (!userProfile) return;
 
         void (async () => {
-            // Delete faces rows for this profile and clear profiles.face_descriptor for backward compatibility
+            // Delete faces rows for this profile and clear legacy profile descriptor storage
             try {
                 const { error: delErr } = await supabase.from('faces').delete().eq('profile_id', userProfile.id);
                 if (delErr) console.warn('Failed to delete faces rows:', delErr);
             } catch (err) {
                 console.warn('faces delete exception:', err);
-            }
-
-            const { error } = await supabase
-                .from('profiles')
-                .update({ face_descriptor: null })
-                .eq('id', userProfile.id);
-
-            if (error) {
-                alert(`Reset enrolled face gagal: ${error.message}`);
-                return;
             }
 
             referenceDescriptorRef.current = null;

@@ -2,6 +2,7 @@ import React, { useRef, useEffect, useState } from 'react';
 import { supabase } from '../supabaseClient';
 import RegisterLogo from '../assets/customs-logo.jpg';
 import * as faceapi from 'face-api.js';
+import { invokeBiometricVerification } from '../utils/biometricVerification';
 
 const RegisterView = () => {
   const videoRef = useRef(null);
@@ -101,19 +102,32 @@ const RegisterView = () => {
       // Konversi Face Descriptor ke Array Float Murni (Anti Error 500)
       const faceDescriptorArray = Array.from(detection.descriptor);
 
-      // Insert ke tabel user_profiles
+      // Insert ke tabel profiles tanpa membawa descriptor ke client-side storage
 const { data: profiles, error: profileError } = await supabase
   .from('profiles')  // FROM user_profiles --> profiles
   .insert([{
     id: newUser.id,  // FROM user_id --> id
-    face_descriptor: faceDescriptorArray
+    name,
+    email,
+    initials: initials.toUpperCase(),
+    role: 'employee'
   }]);
 
       if (profileError) {
         console.error("Gagal simpan profil wajah:", profileError);
         alert(`Akun terbuat tapi profil wajah gagal masuk: ${profileError.message}`);
       } else {
-        alert("🔥 REGISTRASI AKUN + BIOMETRIK WAJAH BERHASIL!");
+        const enrollVerdict = await invokeBiometricVerification({
+          action: 'enroll',
+          descriptor: faceDescriptorArray,
+          metadata: { source: 'register-view' },
+        });
+
+        if (!enrollVerdict.allowed) {
+          throw new Error(`Enroll gagal: ${enrollVerdict.reason || 'UNKNOWN'}`);
+        }
+
+        alert(`🔥 REGISTRASI AKUN + BIOMETRIK WAJAH BERHASIL! Confidence ${enrollVerdict.confidence}`);
         // Redirect ke login
         window.location.href = '/';
       }
